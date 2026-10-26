@@ -18,7 +18,9 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -43,7 +45,9 @@ type Driver struct {
 	nodeService
 	provisionerService
 
+	mu       sync.Mutex // guards srv and stopped during startup and shutdown
 	srv      *grpc.Server
+	stopped  bool
 	endpoint string
 }
 
@@ -88,20 +92,24 @@ func NewDriver(endpoint string, nodeID string,
 
 // Run runs the server
 func (d *Driver) Run() error {
-	if config.Provisioner {
-		go d.provisionerService.Run(context.Background())
+	d.mu.Lock()
+	if d.stopped {
+		d.mu.Unlock()
+		return nil
 	}
 	scheme, addr, err := util.ParseEndpoint(d.endpoint)
 	if err != nil {
+		d.mu.Unlock()
 		return err
 	}
 
 	listener, err := net.Listen(scheme, addr)
 	if err != nil {
+		d.mu.Unlock()
 		return err
 	}
 
-	logErr := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	logErr := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		resp, err := handler(ctx, req)
 		if err != nil {
 			driverLog.Error(err, "GRPC error")
@@ -111,18 +119,34 @@ func (d *Driver) Run() error {
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(logErr),
 	}
-	d.srv = grpc.NewServer(opts...)
+	srv := grpc.NewServer(opts...)
 
-	csi.RegisterIdentityServer(d.srv, d)
-	csi.RegisterControllerServer(d.srv, d)
-	csi.RegisterNodeServer(d.srv, d)
+	csi.RegisterIdentityServer(srv, d)
+	csi.RegisterControllerServer(srv, d)
+	csi.RegisterNodeServer(srv, d)
+	d.srv = srv
+	if config.Provisioner {
+		go d.provisionerService.Run(context.Background())
+	}
+	d.mu.Unlock()
 
 	driverLog.Info("Listening for connection on address", "address", listener.Addr())
-	return d.srv.Serve(listener)
+	err = srv.Serve(listener)
+	// Stop may run after initialization but before Serve starts accepting requests.
+	if errors.Is(err, grpc.ErrServerStopped) {
+		return nil
+	}
+	return err
 }
 
 // Stop stops server
 func (d *Driver) Stop() {
+	d.mu.Lock()
+	d.stopped = true
+	srv := d.srv
+	d.mu.Unlock()
+	if srv != nil {
+		srv.Stop()
+	}
 	driverLog.Info("Stopped server")
-	d.srv.Stop()
 }
